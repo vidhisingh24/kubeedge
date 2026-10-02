@@ -102,6 +102,33 @@ func (s *MetaV2Service) DeleteByKey(key string) error {
 	return s.db.Where(models.KEY+" = ?", key).Delete(&models.MetaV2{}).Error
 }
 
+// ListPassThroughMetaV2 returns the responses saved for pass-through requests,
+// such as discovery documents, which are not bound to any resource.
+func (s *MetaV2Service) ListPassThroughMetaV2() (*[]models.MetaV2, error) {
+	var objs []models.MetaV2
+	if err := s.db.Model(&models.MetaV2{}).Where(models.GVR+" = ?", "").Find(&objs).Error; err != nil {
+		return nil, err
+	}
+	return &objs, nil
+}
+
+// MoveMetaV2 replaces the objects saved under oldKeys with newObjs in a single
+// transaction. An object already saved under the key of a new object is kept,
+// because it was written after the object being moved.
+func (s *MetaV2Service) MoveMetaV2(oldKeys []string, newObjs []models.MetaV2) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if len(newObjs) > 0 {
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&newObjs).Error; err != nil {
+				return err
+			}
+		}
+		if len(oldKeys) > 0 {
+			return tx.Where(models.KEY+" IN ?", oldKeys).Delete(&models.MetaV2{}).Error
+		}
+		return nil
+	})
+}
+
 // upgrade_db
 func (s *MetaV2Service) SaveNodeUpgradeJobRequestToMetaV2(nodeUpgradeJobReq commontypes.NodeUpgradeJobRequest) error {
 	db := s.db

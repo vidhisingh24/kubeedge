@@ -11,6 +11,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/klog/v2"
@@ -101,6 +102,50 @@ func (s *imitator) insertOrReplaceMetaV2(m models.MetaV2, objRv uint64) error {
 	}
 	klog.V(4).Infof("[metaserver]successfully insert or update obj:%v", m.Key)
 	return nil
+}
+
+// migrateResource moves the objects of gvk saved under oldGVR to newGVR. It is
+// called when the authoritative resource of gvk becomes known, so that objects
+// saved under a guessed resource, e.g. gatewaies for Gateway, are served again.
+func (s *imitator) migrateResource(gvk schema.GroupVersionKind, oldGVR, newGVR schema.GroupVersionResource) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	service := dbclient.NewMetaV2Service()
+	results, err := service.RawMetaByGVRNN(oldGVR, models.NullNamespace, models.NullName)
+	if err != nil {
+		klog.Errorf("[metaserver] failed to query objects of %s to move them to %s: %v", oldGVR.String(), newGVR.String(), err)
+		return
+	}
+
+	var oldKeys []string
+	var moved []models.MetaV2
+	for _, result := range *results {
+		obj := new(unstructured.Unstructured)
+		if err := runtime.DecodeInto(s.codec, []byte(result.Value), obj); err != nil {
+			klog.Warningf("[metaserver] failed to decode object %s: %v", result.Key, err)
+			continue
+		}
+		if obj.GroupVersionKind() != gvk {
+			continue
+		}
+		key, err := metaserver.KeyFuncObj(obj)
+		if err != nil || key == result.Key {
+			continue
+		}
+		oldKeys = append(oldKeys, result.Key)
+		result.Key = key
+		result.GroupVersionResource = newGVR.String()
+		moved = append(moved, result)
+	}
+	if len(moved) == 0 {
+		return
+	}
+	if err := service.MoveMetaV2(oldKeys, moved); err != nil {
+		klog.Errorf("[metaserver] failed to move objects of %s from %s to %s: %v", gvk.String(), oldGVR.String(), newGVR.String(), err)
+		return
+	}
+	klog.Infof("[metaserver] moved %d objects of %s from %s to %s", len(moved), gvk.String(), oldGVR.String(), newGVR.String())
 }
 
 func (s *imitator) GetPassThroughObj(_ context.Context, key string) ([]byte, error) {
